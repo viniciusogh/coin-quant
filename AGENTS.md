@@ -114,21 +114,23 @@ coin-quant/
 | 주요 원인 | 4월 초 급등장에서 숏 시그널 연속 4번 손절 |
 
 ### 다음 할 일 (우선순위)
-1. **전략 파라미터 개선** — RSI 기준값 조정, 연속 손절 방지 로직 추가
-2. **더 긴 기간 백테스트** — 1년치 이상 데이터 수집 (페이지네이션으로 Binance에서 과거 데이터 수집)
-3. **Telegram 봇** 셋업 — 알림 연결
-4. **리스크 모듈** (`src/risk/`) — Kill Switch, 포지션 사이징
-5. **주문 실행 모듈** (`src/execution/`) — 실제 주문 발송
+1. **페이퍼 트레이딩 1개월** — GitHub Actions로 자동 실행 중, 결과 축적
+2. **전략 추가 검증** — 더 긴 기간 데이터로 재백테스트
+3. **주문 실행 모듈** (`src/execution/`) — 실제 주문 발송 (Phase 4)
+4. **Oracle Cloud VPS** — 카카오페이 가상카드 발급 후 24/7 안정적 운영
 
 ### 현재 파일 구조
 ```
 coin-quant/
 ├── AGENTS.md
-├── .env                  # API 키 (gitignore됨)
+├── .env                       # API 키 (gitignore됨)
 ├── .env.example
 ├── .gitignore
 ├── requirements.txt
-├── main.py
+├── main.py                    ✅ 로컬 실행용
+├── bot_runner.py              ✅ GitHub Actions용
+├── position.json              ✅ 페이퍼 트레이딩 상태
+├── .github/workflows/bot.yml  ✅ 15분마다 자동 실행
 ├── docs/
 │   ├── BINANCE_API.md
 │   └── STRATEGY.md
@@ -136,13 +138,20 @@ coin-quant/
 │   ├── data/fetcher.py        ✅ 완료
 │   ├── signal/
 │   │   ├── indicators.py      ✅ 완료
-│   │   └── rsi_strategy.py   ✅ 완료
+│   │   ├── ema_strategy.py    ✅ 완료 (현재 사용)
+│   │   ├── breakout_strategy.py ✅ 완료
+│   │   └── rsi_strategy.py    ✅ 완료
 │   ├── backtest/engine.py     ✅ 완료
-│   ├── risk/                  🔲 미구현
-│   ├── execution/             🔲 미구현
-│   └── monitor/               🔲 미구현
+│   ├── risk/manager.py        ✅ 완료
+│   ├── monitor/telegram_bot.py ✅ 완료
+│   └── execution/             🔲 미구현 (Phase 4)
 └── tests/
 ```
+
+### GitHub
+- Repo: https://github.com/viniciusogh/coin-quant
+- Secrets 등록 완료 (BINANCE_API_KEY, BINANCE_SECRET_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+- Actions: 15분마다 자동 실행 → 텔레그램 알림
 
 ### venv 활성화
 ```bash
