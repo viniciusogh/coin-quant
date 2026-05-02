@@ -2,7 +2,7 @@
   "position": null,
   "capital": 100.0,
   "daily_start": 100.0,
-  "today": "2026-05-02",
+  "today": "2026-05-03",
   "daily_trades": 0,
   "daily_pnl": 0.0,
   "kill_switch": false,
@@ -10,5 +10,5 @@
   "wins": 0,
   "losses": 0,
   "last_signal_candle": null,
-  "run_count": 1
+  "run_count": 2
 }
