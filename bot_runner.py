@@ -24,8 +24,11 @@ SL_PCT           = 0.01    # 손절 1%
 TP_PCT           = 0.03    # 익절 3% (R:R 1:3)
 MAX_POS_PCT      = 0.20
 DAILY_LOSS_LIMIT = 0.30
-STATE_FILE       = "position.json"
+STATE_FILE       = os.path.expanduser("~/.coin-quant/position.json")
 STATUS_INTERVAL  = 8       # 2시간마다 현황 (15분 × 8)
+MIN_RUN_GAP_SEC  = 600     # 큐 폭주 방지: 마지막 실행 후 10분 이내면 skip
+
+os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
 
 # ── 텔레그램 ─────────────────────────────────────────────
 def tg(msg: str):

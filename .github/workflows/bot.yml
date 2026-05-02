@@ -1,9 +1,9 @@
 name: coin-quant bot
 
 on:
-  schedule:
-    - cron: '*/15 * * * *'   # 15분마다 실행
-  workflow_dispatch:           # 수동 실행 버튼
+  # schedule 비활성화 — Oracle Cloud 이전 중. 자동 실행 X.
+  # - cron: '*/15 * * * *'
+  workflow_dispatch:           # 수동 실행 버튼만 유지
 
 permissions:
   contents: write
