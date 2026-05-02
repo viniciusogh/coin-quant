@@ -1,8 +1,7 @@
 """
-GitHub Actions용 봇 런너
-- 15분마다 실행됨
-- position.json에서 상태 읽고 → 체크 → 저장
-- 텔레그램으로 결과 전송
+GitHub Actions용 봇 런너 v2
+전략: 15m RSI(7) 단타 | 1h 추세 필터 | SL 1% / TP 3%
+알림: 시그널/체결 시 + 2시간마다 현황 + 일일 결산
 """
 
 import os
@@ -21,11 +20,12 @@ TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
 SYMBOL     = os.environ.get("SYMBOL", "BTCUSDT")
 SEED_USDT  = float(os.environ.get("SEED_USDT", 100))
 LEVERAGE   = int(os.environ.get("LEVERAGE", 3))
-SL_PCT     = 0.02
-TP_PCT     = 0.05
-MAX_POS_PCT = 0.20
+SL_PCT           = 0.01    # 손절 1%
+TP_PCT           = 0.03    # 익절 3% (R:R 1:3)
+MAX_POS_PCT      = 0.20
 DAILY_LOSS_LIMIT = 0.30
-STATE_FILE = "position.json"
+STATE_FILE       = "position.json"
+STATUS_INTERVAL  = 8       # 2시간마다 현황 (15분 × 8)
 
 # ── 텔레그램 ─────────────────────────────────────────────
 def tg(msg: str):
@@ -81,7 +81,7 @@ def get_price() -> float:
     d = binance_get("/fapi/v1/ticker/price", {"symbol": SYMBOL})
     return float(d["price"])
 
-# ── 지표 계산 ─────────────────────────────────────────────
+# ── 지표 계산 ─────────────────────────────────────────────────────
 def ema(values: list, span: int) -> list:
     k = 2 / (span + 1)
     result = [values[0]]
@@ -89,104 +89,112 @@ def ema(values: list, span: int) -> list:
         result.append(v * k + result[-1] * (1 - k))
     return result
 
-def volume_ma(volumes: list, period: int = 20) -> list:
-    result = [None] * (period - 1)
-    for i in range(period - 1, len(volumes)):
-        result.append(sum(volumes[i - period + 1:i + 1]) / period)
-    return result
+def calc_rsi(closes: list, period: int = 7) -> list:
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains  = [max(d, 0) for d in deltas]
+    losses = [abs(min(d, 0)) for d in deltas]
+    k = 1 / period
+    avg_g, avg_l = gains[0], losses[0]
+    rsi = []
+    for g, l in zip(gains[1:], losses[1:]):
+        avg_g = avg_g * (1-k) + g * k
+        avg_l = avg_l * (1-k) + l * k
+        rs = avg_g / avg_l if avg_l else 100
+        rsi.append(100 - 100 / (1 + rs))
+    return [None] * (period + 1) + rsi
 
-# ── 시그널 생성 ───────────────────────────────────────────
-def generate_signal(klines_1h: list, klines_4h: list) -> str:
-    def parse(klines):
-        closes  = [float(k[4]) for k in klines]
-        volumes = [float(k[5]) for k in klines]
-        times   = [k[0] for k in klines]
-        return closes, volumes, times
+# ── 시그널 생성 (15m RSI + 1h 추세) ─────────────────────────────
+def generate_signal(klines_15m: list, klines_1h: list):
+    c15m = [float(k[4]) for k in klines_15m]
+    t15m = [k[0] for k in klines_15m]
+    c1h  = [float(k[4]) for k in klines_1h]
 
-    c1h, v1h, t1h = parse(klines_1h)
-    c4h, _, _     = parse(klines_4h)
+    if len(c15m) < 50 or len(c1h) < 200:
+        return "NONE", "데이터 부족", t15m[-1]
 
-    if len(c1h) < 60 or len(c4h) < 200:
-        return "NONE", "데이터 부족", t1h[-1]
+    # 1h 추세 판단
+    e50  = ema(c1h, 50)
+    e200 = ema(c1h, 200)
+    gap  = abs(e50[-1] - e200[-1]) / e200[-1]
+    if gap < 0.003:
+        return "NONE", "횡보 구간", t15m[-1]
+    trend_up   = e50[-1] > e200[-1]
+    trend_down = e50[-1] < e200[-1]
+    trend_label = "상승" if trend_up else "하락"
 
-    # 4h 추세
-    e50_4h  = ema(c4h, 50)
-    e200_4h = ema(c4h, 200)
-    last_4h = e50_4h[-1]
-    l200_4h = e200_4h[-1]
-    gap = abs(last_4h - l200_4h) / l200_4h
-    if gap < 0.005:
-        return "NONE", "횡보 구간", t1h[-1]
+    # 15m RSI(7)
+    rsi = calc_rsi(c15m, 7)
+    if rsi[-1] is None or rsi[-2] is None:
+        return "NONE", "RSI 계산 중", t15m[-1]
 
-    trend_up   = last_4h > l200_4h
-    trend_down = last_4h < l200_4h
+    if trend_up   and rsi[-2] < 25 and rsi[-1] >= 25:
+        return "LONG",  f"RSI {rsi[-2]:.1f}→{rsi[-1]:.1f} 과매도 복귀 | 1h {trend_label}추세", t15m[-1]
+    if trend_down and rsi[-2] > 75 and rsi[-1] <= 75:
+        return "SHORT", f"RSI {rsi[-2]:.1f}→{rsi[-1]:.1f} 과매수 복귀 | 1h {trend_label}추세", t15m[-1]
 
-    # 1h EMA21/55
-    e21 = ema(c1h, 21)
-    e55 = ema(c1h, 55)
-    vma = volume_ma(v1h, 20)
-
-    prev_cross = e21[-2] <= e55[-2]
-    curr_cross = e21[-1] > e55[-1]
-    golden = prev_cross and curr_cross
-
-    prev_death = e21[-2] >= e55[-2]
-    curr_death = e21[-1] < e55[-1]
-    death = prev_death and curr_death
-
-    vol_ok = vma[-1] is not None and v1h[-1] >= vma[-1] * 1.5
-
-    if trend_up and golden and vol_ok:
-        return "LONG", f"EMA21 상향돌파 | 볼륨 확인", t1h[-1]
-    if trend_down and death and vol_ok:
-        return "SHORT", f"EMA21 하향돌파 | 볼륨 확인", t1h[-1]
-
-    return "NONE", "조건 미충족", t1h[-1]
+    return "NONE", f"RSI {rsi[-1]:.1f} | 1h {trend_label}추세", t15m[-1]
 
 # ── 메인 ─────────────────────────────────────────────────
 def main():
     now = datetime.now(timezone.utc)
     today_str = str(date.today())
-    print(f"[{now.strftime('%Y-%m-%d %H:%M')} UTC] 실행 시작")
+    kst_str   = f"{now.hour+9:02d}:{now.minute:02d} KST"  # UTC+9
+    run_count = state_run_count()
+    print(f"[{now.strftime('%Y-%m-%d %H:%M')} UTC] #{run_count} 실행")
 
     state = load_state()
 
     # 일일 초기화
     if state["today"] != today_str:
-        state["today"]        = today_str
-        state["daily_start"]  = state["capital"]
-        state["daily_trades"] = 0
-        state["daily_pnl"]    = 0.0
-        state["kill_switch"]  = False
-        tg(f"📅 <b>일일 초기화</b>\n잔고: ${state['capital']:.2f}")
+        prev_capital = state["capital"]
+        prev_trades  = state.get("total_trades", 0)
+        prev_wins    = state.get("wins", 0)
+        state.update({"today": today_str, "daily_start": prev_capital,
+                      "daily_trades": 0, "daily_pnl": 0.0, "kill_switch": False})
+        wr = prev_wins / prev_trades * 100 if prev_trades else 0
+        tg(
+            f"📅 <b>새 날 시작</b> ({today_str})\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"어제까지 잔고: <b>${prev_capital:.2f}</b>\n"
+            f"총 누적 거래: {prev_trades}건 | 승률 {wr:.1f}%"
+        )
 
     # Kill Switch
     if state["kill_switch"]:
-        tg(f"🚫 Kill Switch 활성 — 오늘 거래 중단\n잔고: ${state['capital']:.2f}")
         save_state(state)
-        return
+        return  # 알림 없이 조용히 스킵
 
     # 데이터 수집
-    klines_1h = get_klines("1h", 300)
-    klines_4h = get_klines("4h", 300)
-    price = get_price()
+    klines_15m = get_klines("15m", 300)
+    klines_1h  = get_klines("1h",  300)
+    price      = get_price()
+    total      = state["total_trades"]
+    wr         = state["wins"] / total * 100 if total else 0
+    pnl_sign   = "+" if state["daily_pnl"] >= 0 else ""
+    cap_pct    = (state["capital"] - SEED_USDT) / SEED_USDT * 100
 
     # 포지션 모니터링
     pos = state["position"]
     if pos:
         sl, tp, sig = pos["sl"], pos["tp"], pos["signal"]
-        entry = pos["entry"]
-        qty   = pos["qty"]
+        entry, qty  = pos["entry"], pos["qty"]
+        entry_time  = pos.get("entry_time", "")
+        unrealized  = qty*(price-entry) if sig=="LONG" else qty*(entry-price)
+        unr_pct     = (price/entry - 1) * 100 if sig=="LONG" else (entry/price - 1) * 100
+        sl_dist_pct = abs(price - sl) / price * 100
+        tp_dist_pct = abs(tp - price) / price * 100
 
-        hit_sl = (sig == "LONG" and price <= sl) or (sig == "SHORT" and price >= sl)
-        hit_tp = (sig == "LONG" and price >= tp) or (sig == "SHORT" and price <= tp)
+        hit_sl = (sig=="LONG" and price<=sl) or (sig=="SHORT" and price>=sl)
+        hit_tp = (sig=="LONG" and price>=tp) or (sig=="SHORT" and price<=tp)
 
         if hit_sl or hit_tp:
             outcome = "TP" if hit_tp else "SL"
             exit_p  = tp if hit_tp else sl
-            pnl     = qty * (exit_p - entry) if sig == "LONG" else qty * (entry - exit_p)
-            fee     = (qty * entry + qty * exit_p) * 0.0004
+            pnl     = qty*(exit_p-entry) if sig=="LONG" else qty*(entry-exit_p)
+            fee     = (qty*entry + qty*exit_p) * 0.0004
             net_pnl = pnl - fee
+            hold_bars = (run_count - pos.get("entry_run", run_count))
+            hold_str  = f"{hold_bars * 15}분"
 
             state["capital"]      += net_pnl
             state["daily_pnl"]    += net_pnl
@@ -194,72 +202,115 @@ def main():
             state["total_trades"] += 1
             state["position"]      = None
             state["last_signal_candle"] = None
+            if outcome == "TP": state["wins"]   += 1
+            else:               state["losses"] += 1
 
-            if outcome == "TP":
-                state["wins"] += 1
-            else:
-                state["losses"] += 1
+            new_total = state["total_trades"]
+            new_wr    = state["wins"] / new_total * 100
+            cap_chg   = (state["capital"] - SEED_USDT) / SEED_USDT * 100
 
-            icon = "✅" if outcome == "TP" else "❌"
+            icon  = "✅" if outcome == "TP" else "❌"
+            label = "익절 성공" if outcome == "TP" else "손절"
             tg(
-                f"{icon} <b>[{outcome}]</b> {sig}\n"
-                f"진입: ${entry:,.2f} → 청산: ${exit_p:,.2f}\n"
-                f"손익: <b>{'+'if net_pnl>=0 else''}${net_pnl:.2f}</b>\n"
-                f"잔고: ${state['capital']:.2f} | 일일: {'+'if state['daily_pnl']>=0 else''}${state['daily_pnl']:.2f}"
+                f"{icon} <b>[{label}]</b> {sig} | 📋 페이퍼\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"진입: ${entry:,.2f}  →  청산: ${exit_p:,.2f}\n"
+                f"수익: <b>{'+'if net_pnl>=0 else''}${net_pnl:.2f}</b>  (수수료 포함)\n"
+                f"보유 시간: {hold_str}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"잔고: <b>${state['capital']:.2f}</b>  ({'+' if cap_chg>=0 else ''}{cap_chg:.2f}% from ${SEED_USDT:.0f})\n"
+                f"오늘: {pnl_sign}${state['daily_pnl']:.2f}  |  누적 {new_total}건 승률 {new_wr:.1f}%"
             )
 
-            # Kill Switch 체크
-            daily_loss_pct = state["daily_pnl"] / state["daily_start"]
-            if daily_loss_pct <= -DAILY_LOSS_LIMIT:
+            # Kill Switch
+            loss_pct = state["daily_pnl"] / state["daily_start"]
+            if loss_pct <= -DAILY_LOSS_LIMIT:
                 state["kill_switch"] = True
-                tg(f"🚨 <b>Kill Switch 발동!</b>\n일일 손실 {daily_loss_pct*100:.1f}%\n오늘 거래 중단")
-
-        else:
-            # 포지션 유지 중 — 현황 알림
-            unrealized = qty * (price - entry) if sig == "LONG" else qty * (entry - price)
-            tg(
-                f"📊 <b>포지션 유지 중</b> | BTC ${price:,.2f}\n"
-                f"{sig} @ ${entry:,.2f}\n"
-                f"미실현: {'+'if unrealized>=0 else''}${unrealized:.2f}\n"
-                f"손절: ${sl:,.2f} | 익절: ${tp:,.2f}"
-            )
+                tg(
+                    f"🚨 <b>Kill Switch 발동!</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"일일 손실: <b>{loss_pct*100:.1f}%</b> (한도 -{DAILY_LOSS_LIMIT*100:.0f}%)\n"
+                    f"모든 거래 중단 → 자정 후 자동 재개\n"
+                    f"잔고: ${state['capital']:.2f}"
+                )
 
     # 신규 시그널
     if not state["position"]:
-        signal, reason, candle_time = generate_signal(klines_1h, klines_4h)
+        signal, reason, candle_time = generate_signal(klines_15m, klines_1h)
         candle_str = str(candle_time)
-        total = state["total_trades"]
-        wr = state["wins"] / total * 100 if total else 0
 
         if signal in ("LONG", "SHORT") and candle_str != state["last_signal_candle"]:
             qty = (state["capital"] * MAX_POS_PCT * LEVERAGE) / price
-            sl  = price * (1 - SL_PCT) if signal == "LONG" else price * (1 + SL_PCT)
-            tp  = price * (1 + TP_PCT) if signal == "LONG" else price * (1 - TP_PCT)
+            sl  = price*(1-SL_PCT) if signal=="LONG" else price*(1+SL_PCT)
+            tp  = price*(1+TP_PCT) if signal=="LONG" else price*(1-TP_PCT)
+            pos_usdt    = state["capital"] * MAX_POS_PCT
+            max_loss    = pos_usdt * LEVERAGE * SL_PCT
+            max_profit  = pos_usdt * LEVERAGE * TP_PCT
 
             state["position"] = {
                 "signal": signal, "entry": price,
-                "sl": sl, "tp": tp, "qty": qty
+                "sl": sl, "tp": tp, "qty": qty,
+                "entry_time": kst_str, "entry_run": run_count
             }
             state["last_signal_candle"] = candle_str
 
             icon = "🟢" if signal == "LONG" else "🔴"
             tg(
-                f"{icon} <b>[{signal} 진입]</b> 📋 페이퍼\n"
-                f"BTC: <b>${price:,.2f}</b>\n"
-                f"손절: ${sl:,.2f} | 익절: ${tp:,.2f}\n"
-                f"누적 {total}건 | 승률 {wr:.1f}%"
-            )
-        else:
-            # 시그널 없음 — 15분마다 현황 요약
-            tg(
-                f"⏱ <b>정기 현황</b> [{now.strftime('%H:%M')} UTC]\n"
-                f"BTC: ${price:,.2f} | 시그널: {signal}\n"
-                f"잔고: ${state['capital']:.2f} | 일일: {'+'if state['daily_pnl']>=0 else''}${state['daily_pnl']:.2f}\n"
-                f"누적 {state['total_trades']}건 | 승률 {wr:.1f}%"
+                f"{icon} <b>[{signal} 진입]</b> 📋 페이퍼 | {kst_str}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"BTC 진입가: <b>${price:,.2f}</b>\n"
+                f"손절가: ${sl:,.2f}  ({'-' if signal=='LONG' else '+'}{SL_PCT*100:.0f}%)\n"
+                f"익절가: ${tp:,.2f}  ({'+' if signal=='LONG' else '-'}{TP_PCT*100:.0f}%)\n"
+                f"시그널: {reason}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"포지션: ${pos_usdt:.1f} × {LEVERAGE}x\n"
+                f"최대손실: -${max_loss:.2f}  |  최대수익: +${max_profit:.2f}\n"
+                f"잔고: ${state['capital']:.2f}  |  누적 {total}건 승률 {wr:.1f}%"
             )
 
+        # 2시간마다 현황 알림 (시그널 없을 때)
+        elif run_count % STATUS_INTERVAL == 0:
+            pos_status = "없음"
+            if state["position"]:
+                p = state["position"]
+                unr = qty*(price-p["entry"]) if p["signal"]=="LONG" else qty*(p["entry"]-price)
+                pos_status = f"{p['signal']} @ ${p['entry']:,.0f} (미실현 {'+'if unr>=0 else''}${unr:.2f})"
+            tg(
+                f"📊 <b>정기 현황</b> | {kst_str}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"BTC: <b>${price:,.2f}</b>\n"
+                f"시그널: {signal} ({reason})\n"
+                f"포지션: {pos_status}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"잔고: ${state['capital']:.2f}  ({'+' if cap_pct>=0 else ''}{cap_pct:.2f}%)\n"
+                f"오늘: {pnl_sign}${state['daily_pnl']:.2f}  ({state['daily_trades']}건)\n"
+                f"누적: {total}건 | 승률 {wr:.1f}%"
+            )
+
+        # 일일 결산 (자정 KST = UTC 15:00)
+        if now.hour == 15 and now.minute < 16:
+            tg(
+                f"🌙 <b>일일 결산</b> ({today_str})\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"오늘 손익: <b>{pnl_sign}${state['daily_pnl']:.2f}</b>  ({state['daily_trades']}건)\n"
+                f"현재 잔고: <b>${state['capital']:.2f}</b>\n"
+                f"시작 잔고: ${SEED_USDT:.2f}  →  누적 {'+' if cap_pct>=0 else ''}{cap_pct:.2f}%\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"전체 {total}건 | 승률 {wr:.1f}% | W{state['wins']}/L{state['losses']}"
+            )
+
+    state["run_count"] = run_count
     save_state(state)
-    print("완료")
+    print(f"완료 (#{run_count})")
+
+
+def state_run_count():
+    """실행 횟수 추적 (position.json의 run_count 필드)"""
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f).get("run_count", 0) + 1
+    except:
+        return 1
 
 
 if __name__ == "__main__":
