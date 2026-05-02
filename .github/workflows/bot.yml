@@ -1,0 +1,44 @@
+name: coin-quant bot
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # 15분마다 실행
+  workflow_dispatch:           # 수동 실행 버튼
+
+permissions:
+  contents: write
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests pandas
+
+      - name: Run bot
+        env:
+          BINANCE_API_KEY:    ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_SECRET_KEY: ${{ secrets.BINANCE_SECRET_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          SYMBOL:    BTCUSDT
+          LEVERAGE:  "3"
+          SEED_USDT: "100"
+        run: python bot_runner.py
+
+      - name: Save state
+        run: |
+          git config user.name  "coin-quant-bot"
+          git config user.email "bot@coin-quant"
+          git add position.json
+          git diff --staged --quiet || git commit -m "chore: update state [skip ci]"
+          git push

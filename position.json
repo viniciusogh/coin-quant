@@ -1,0 +1,13 @@
+{
+  "position": null,
+  "capital": 100.0,
+  "daily_start": 100.0,
+  "today": "",
+  "daily_trades": 0,
+  "daily_pnl": 0.0,
+  "kill_switch": false,
+  "total_trades": 0,
+  "wins": 0,
+  "losses": 0,
+  "last_signal_candle": null
+}
