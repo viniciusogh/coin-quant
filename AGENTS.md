@@ -113,24 +113,37 @@ coin-quant/
 | MDD | -11.97% |
 | 주요 원인 | 4월 초 급등장에서 숏 시그널 연속 4번 손절 |
 
+### 호스팅 (2026-05-04 마이그레이션 완료)
+- **Oracle Cloud (Always Free) — Chuncheon 리전**
+  - 인스턴스: `coin-quant-bot` / VM.Standard.E2.1.Micro / Ubuntu 22.04
+  - Shape: AMD 1/8 OCPU + 1 GB RAM (ARM A1.Flex는 매진으로 폴백)
+  - Public IP: `140.245.68.161` (한국 IP — Binance 통과 확인 ✅)
+  - VCN: `coin-quant-vcn` + Public Subnet (Internet Gateway 자동)
+  - SSH: `ssh -i ~/.ssh/oracle_coin_quant ubuntu@140.245.68.161`
+- **스케줄러**: 서버 cron `*/15 * * * * /home/ubuntu/run_bot.sh`
+  - GitHub Actions schedule 폐기 (commit `51cff84` — 큐 catch-up 폭주 + push 인증 이슈)
+- **State 파일**: `~/.coin-quant/position.json` (서버 디스크, repo 밖)
+- **시크릿**: `~/.coin-quant/env` (chmod 600, repo 밖)
+- **로그**: `~/.coin-quant/bot.log` (logrotate `/etc/logrotate.d/coin-quant`, 14일 보관)
+- **참고**: bot_runner.py는 공개 엔드포인트만 호출 (signed 호출 X) — Binance API 키 IP whitelist 갱신 불필요
+
 ### 다음 할 일 (우선순위)
-1. **페이퍼 트레이딩 1개월** — GitHub Actions로 자동 실행 중, 결과 축적
+1. **페이퍼 트레이딩 1개월** — Oracle 24/7 자동 실행, 결과 축적
 2. **전략 추가 검증** — 더 긴 기간 데이터로 재백테스트
-3. **주문 실행 모듈** (`src/execution/`) — 실제 주문 발송 (Phase 4)
-4. **Oracle Cloud VPS** — 카카오페이 가상카드 발급 후 24/7 안정적 운영
+3. **주문 실행 모듈** (`src/execution/`) — 실제 주문 발송 (Phase 4, signed call 필요 → 그때 IP whitelist에 `140.245.68.161` 추가)
 
 ### 현재 파일 구조
 ```
 coin-quant/
 ├── AGENTS.md
-├── .env                       # API 키 (gitignore됨)
+├── .env                       # API 키 (gitignore됨, 로컬 Mac만)
 ├── .env.example
 ├── .gitignore
 ├── requirements.txt
 ├── main.py                    ✅ 로컬 실행용
-├── bot_runner.py              ✅ GitHub Actions용
-├── position.json              ✅ 페이퍼 트레이딩 상태
-├── .github/workflows/bot.yml  ✅ 15분마다 자동 실행
+├── bot_runner.py              ✅ Oracle cron용 (STATE_FILE = ~/.coin-quant/position.json)
+├── position.json              ⚠ 사용 안 함 (state는 ~/.coin-quant/ 로 이동)
+├── .github/workflows/bot.yml  ⛔ schedule 비활성화 (workflow_dispatch 만 유지)
 ├── docs/
 │   ├── BINANCE_API.md
 │   └── STRATEGY.md
@@ -150,8 +163,14 @@ coin-quant/
 
 ### GitHub
 - Repo: https://github.com/viniciusogh/coin-quant
-- Secrets 등록 완료 (BINANCE_API_KEY, BINANCE_SECRET_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
-- Actions: 15분마다 자동 실행 → 텔레그램 알림
+- Secrets는 등록되어 있지만 자동 실행 X (workflow schedule 폐기). 수동 실행만 가능.
+
+### Oracle 서버 운용 메모
+- 봇 수동 실행: `ssh -i ~/.ssh/oracle_coin_quant ubuntu@140.245.68.161 ~/run_bot.sh`
+- 로그 확인: `ssh ubuntu@140.245.68.161 'tail -f ~/.coin-quant/bot.log'`
+- crontab 확인/수정: `ssh ubuntu@140.245.68.161 'crontab -l'` / `crontab -e`
+- state 확인: `ssh ubuntu@140.245.68.161 'cat ~/.coin-quant/position.json'`
+- 봇 일시 정지: `ssh ubuntu@140.245.68.161 'crontab -r'` (다시 등록은 `*/15 * * * * /home/ubuntu/run_bot.sh >> /home/ubuntu/.coin-quant/bot.log 2>&1`)
 
 ### venv 활성화
 ```bash
