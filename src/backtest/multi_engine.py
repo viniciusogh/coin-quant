@@ -37,12 +37,16 @@ def run_backtest(
     entry_planner,       # callable(signal, capital, params) -> EntryPlan
     seed: float = 100.0,
     params: dict | None = None,
-    iv_exec_ms: int = 900_000,    # default 15m
-    iv_mid_ms: int = 3_600_000,   # default 1h
-    iv_high_ms: int = 14_400_000, # default 4h
+    iv_exec_ms: int = 900_000,
+    iv_mid_ms: int = 3_600_000,
+    iv_high_ms: int = 14_400_000,
     min_exec_warmup: int = 200,
     min_mid_warmup: int = 210,
     min_high_warmup: int = 210,
+    klines_daily: list | None = None,   # Daily regime gate 용 (None이면 gate X)
+    regime_filter: str | None = None,    # "BEAR_ONLY" | "BULL_ONLY" | None
+    sma_period: int = 200,
+    regime_buffer: float = 0.02,
     verbose: bool = False,
 ) -> dict:
     p = dict(params or {})
@@ -52,6 +56,35 @@ def run_backtest(
     close_exec = [k[0] + iv_exec_ms for k in klines_exec]
     close_mid  = [k[0] + iv_mid_ms  for k in klines_mid]
     close_high = [k[0] + iv_high_ms for k in klines_high]
+
+    # Daily regime gate 사전 계산
+    # BEAR 정의: 가격 < SMA(sma_period) - buffer  AND  가격 < SMA(50)
+    daily_close_times = []
+    daily_regime_at = []
+    if klines_daily and regime_filter:
+        d_closes = [float(k[4]) for k in klines_daily]
+        def _sma(closes, n):
+            out = [None] * len(closes)
+            if len(closes) < n: return out
+            s = sum(closes[:n])
+            out[n-1] = s / n
+            for i in range(n, len(closes)):
+                s += closes[i] - closes[i-n]
+                out[i] = s / n
+            return out
+        d_sma_long = _sma(d_closes, sma_period)
+        daily_close_times = [k[0] + 86_400_000 for k in klines_daily]
+        for i, c in enumerate(d_closes):
+            if d_sma_long[i] is None:
+                daily_regime_at.append("UNKNOWN")
+                continue
+            dev = (c - d_sma_long[i]) / d_sma_long[i]
+            if dev > regime_buffer:
+                daily_regime_at.append("BULL")
+            elif dev < -regime_buffer:
+                daily_regime_at.append("BEAR")
+            else:
+                daily_regime_at.append("NEUTRAL")
 
     if len(close_mid) < min_mid_warmup or len(close_high) < min_high_warmup:
         return {"error": "데이터 부족"}
@@ -132,6 +165,20 @@ def run_backtest(
             if i_mid < min_mid_warmup-1 or i_high < min_high_warmup-1:
                 equity_curve.append(capital)
                 continue
+
+            # Daily regime gate
+            if regime_filter and daily_close_times:
+                i_d = _last_closed_index(daily_close_times, bar_close_time)
+                if i_d < 0 or daily_regime_at[i_d] == "UNKNOWN":
+                    equity_curve.append(capital)
+                    continue
+                cur_regime = daily_regime_at[i_d]
+                if regime_filter == "BEAR_ONLY" and cur_regime != "BEAR":
+                    equity_curve.append(capital)
+                    continue
+                if regime_filter == "BULL_ONLY" and cur_regime != "BULL":
+                    equity_curve.append(capital)
+                    continue
 
             sig = signal_fn(
                 klines_exec[max(0, i-199):i+1],

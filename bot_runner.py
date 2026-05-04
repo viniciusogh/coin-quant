@@ -188,17 +188,16 @@ def get_regime(klines_daily: list) -> tuple[str, float, float]:
 
 # ── Signal (SHORT-only) ──────────────────────────────────
 def generate_short_signal(k15m: list, k1h: list, k4h: list):
-    """closed candle 기준. 마지막 봉은 진행 중일 수 있어 [-2]까지 안전.
-    여기선 단순화로 마지막 봉을 사용(15m 봉 닫힌 직후 cron)."""
+    """closed candle 기준. 시그널 + 진단 정보 dict 같이 반환.
+    Returns: (signal, reason, entry_price, atr, diag_dict)
+    """
     if len(k15m) < 60 or len(k1h) < 210 or len(k4h) < 210:
-        return "NONE", "데이터 부족", None, None
+        return "NONE", "데이터 부족", None, None, {}
 
     # 1h 추세
     c1h = [float(k[4]) for k in k1h]
     e50_1h, e200_1h = ema(c1h, 50), ema(c1h, 200)
     gap_1h = abs(e50_1h[-1] - e200_1h[-1]) / e200_1h[-1]
-    if gap_1h < TREND_GAP_PCT:
-        return "NONE", f"1h 횡보 (격차 {gap_1h*100:.2f}%)", None, None
     trend_1h_down = e50_1h[-1] < e200_1h[-1]
 
     # 4h 추세
@@ -206,33 +205,60 @@ def generate_short_signal(k15m: list, k1h: list, k4h: list):
     e50_4h, e200_4h = ema(c4h, 50), ema(c4h, 200)
     trend_4h_down = e50_4h[-1] < e200_4h[-1]
 
-    if not (trend_1h_down and trend_4h_down):
-        return "NONE", "1h/4h DOWN 추세 아님", None, None
-
     # 15m 데이터
     h15 = [float(k[2]) for k in k15m]
     l15 = [float(k[3]) for k in k15m]
     c15 = [float(k[4]) for k in k15m]
 
     atr_15 = atr(h15, l15, c15, 14)
-    if atr_15[-1] is None:
-        return "NONE", "ATR 미계산", None, None
-    atr_avg = sma([a if a is not None else 0 for a in atr_15], 50)
-    if atr_avg[-1] is None or atr_avg[-1] == 0:
-        return "NONE", "ATR 평균 미계산", None, None
-    if atr_15[-1] >= atr_avg[-1] * ATR_PEAK_MULT:
-        return "NONE", f"ATR 폭증 ({atr_15[-1]:.0f} vs avg {atr_avg[-1]:.0f})", None, None
+    atr_avg = None
+    if atr_15[-1] is not None:
+        atr_avg_list = sma([a if a is not None else 0 for a in atr_15], 50)
+        atr_avg = atr_avg_list[-1]
 
     rsi_15 = rsi(c15, RSI_PERIOD)
-    if rsi_15[-1] is None or rsi_15[-2] is None:
-        return "NONE", "RSI 미계산", None, None
+    rsi_prev = rsi_15[-2] if rsi_15[-2] is not None else None
+    rsi_cur = rsi_15[-1] if rsi_15[-1] is not None else None
 
-    if rsi_15[-2] > RSI_OVERBOUGHT and rsi_15[-1] <= RSI_OVERBOUGHT:
-        reason = (f"1h+4h DOWN | RSI {rsi_15[-2]:.1f}→{rsi_15[-1]:.1f} 과매수 복귀 "
+    diag = {
+        "trend_1h": "DOWN" if trend_1h_down else "UP",
+        "trend_4h": "DOWN" if trend_4h_down else "UP",
+        "gap_1h_pct": gap_1h * 100,
+        "atr_now": atr_15[-1] if atr_15[-1] is not None else 0,
+        "atr_avg50": atr_avg if atr_avg else 0,
+        "atr_ratio": (atr_15[-1] / atr_avg) if (atr_15[-1] and atr_avg) else 0,
+        "rsi_prev": rsi_prev,
+        "rsi_cur": rsi_cur,
+    }
+
+    # 필터 체크
+    if gap_1h < TREND_GAP_PCT:
+        return "NONE", f"1h 추세 약함 (EMA 격차 {gap_1h*100:.2f}%, 최소 {TREND_GAP_PCT*100:.1f}%)", None, None, diag
+    if not (trend_1h_down and trend_4h_down):
+        return "NONE", f"1h/4h 모두 DOWN 아님 (1h={diag['trend_1h']} 4h={diag['trend_4h']})", None, None, diag
+    if atr_15[-1] is None:
+        return "NONE", "ATR 미계산", None, None, diag
+    if atr_avg is None or atr_avg == 0:
+        return "NONE", "ATR 평균 미계산", None, None, diag
+    if atr_15[-1] >= atr_avg * ATR_PEAK_MULT:
+        return "NONE", (f"ATR 폭증 ({atr_15[-1]:.0f} = avg {atr_avg:.0f}의 "
+                        f"{atr_15[-1]/atr_avg:.1f}x, 한도 {ATR_PEAK_MULT}x)"), None, None, diag
+    if rsi_prev is None or rsi_cur is None:
+        return "NONE", "RSI 미계산", None, None, diag
+
+    if rsi_prev > RSI_OVERBOUGHT and rsi_cur <= RSI_OVERBOUGHT:
+        reason = (f"1h+4h DOWN | RSI {rsi_prev:.1f}→{rsi_cur:.1f} 과매수 복귀 "
                   f"| ATR {atr_15[-1]:.0f}")
-        return "SHORT", reason, c15[-1], atr_15[-1]
+        return "SHORT", reason, c15[-1], atr_15[-1], diag
 
-    return "NONE", f"RSI {rsi_15[-1]:.1f} 진입조건 미달", None, None
+    # 시그널 미발생 — RSI 상태 명시
+    if rsi_cur > RSI_OVERBOUGHT:
+        msg = f"RSI {rsi_cur:.1f} 과매수 유지중 (아직 복귀 안 함)"
+    elif rsi_cur < 50:
+        msg = f"RSI {rsi_cur:.1f} (50 미만, 약세 약함)"
+    else:
+        msg = f"RSI {rsi_cur:.1f} (중립 영역, 과매수 대기)"
+    return "NONE", msg, None, None, diag
 
 
 # ── 메인 ─────────────────────────────────────────────────
@@ -247,21 +273,31 @@ def main():
     print(f"[{now.strftime('%Y-%m-%d %H:%M')} UTC] #{run_count} 실행")
 
     # 일일 초기화
+    is_new_day = (state["today"] != today_str and state["today"] != "")
     if state["today"] != today_str:
         prev_capital = state["capital"]
         prev_trades  = state.get("total_trades", 0)
         prev_wins    = state.get("wins", 0)
+        prev_today   = state["today"]
         state.update({
             "today": today_str, "daily_start": prev_capital,
             "daily_trades": 0, "daily_pnl": 0.0, "kill_switch": False,
         })
         wr = prev_wins / prev_trades * 100 if prev_trades else 0
-        if state["today"]:  # 첫 실행 X
+        cap_chg_total = (prev_capital - SEED_USDT) / SEED_USDT * 100
+        if is_new_day:
             tg(
-                f"📅 <b>새 날 시작</b> ({today_str})\n"
-                f"━━━━━━━━━━━━━━━\n"
-                f"어제까지 잔고: <b>${prev_capital:.2f}</b>\n"
-                f"누적 거래: {prev_trades}건 | 승률 {wr:.1f}%"
+                f"📅 <b>새 날 시작</b> {today_str}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"<b>전일 ({prev_today}) 마감</b>\n"
+                f" • 잔고: ${prev_capital:.2f}\n"
+                f" • 시드 대비: {'+'if cap_chg_total>=0 else ''}{cap_chg_total:.2f}%\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"<b>누적 통계</b>\n"
+                f" • 거래: {prev_trades}건\n"
+                f" • 승률: {wr:.1f}% (W{prev_wins}/L{state.get('losses',0)})\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"오늘도 BEAR 지속 시 봇 가동, BULL 전환 시 자동 휴식"
             )
 
     if state["kill_switch"]:
@@ -275,25 +311,41 @@ def main():
     state["current_regime"] = regime
 
     # regime 변경 알림
+    sma_dev = ((cur_price - sma_d) / sma_d * 100) if sma_d else 0
     if prev_regime != "UNKNOWN" and prev_regime != regime:
+        action_msg = {
+            "BEAR":    "🔴 SHORT 봇 가동 시작",
+            "BULL":    "🟢 봇 휴식 (현물 보유 추천)",
+            "NEUTRAL": "⏸ 봇 휴식 (방향 불확실)",
+        }[regime]
         tg(
-            f"🔄 <b>Regime 변경</b>\n"
-            f"━━━━━━━━━━━━━━━\n"
-            f"{prev_regime} → <b>{regime}</b>\n"
-            f"BTC ${cur_price:,.0f} | Daily SMA(200) ${sma_d:,.0f}\n"
-            f"{'봇 가동 ▶️' if regime == 'BEAR' else '봇 휴식 ⏸'}"
+            f"🔄 <b>Regime 변경 감지</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>{prev_regime}</b> → <b>{regime}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"BTC: ${cur_price:,.0f}\n"
+            f"Daily SMA(200): ${sma_d:,.0f}\n"
+            f"이격도: {'+' if sma_dev>=0 else ''}{sma_dev:.2f}%\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{action_msg}\n"
+            f"잔고: ${state['capital']:.2f}"
         )
 
     if regime != "BEAR":
         save_state(state)
         # 2시간마다 휴식 알림
         if run_count % STATUS_INTERVAL == 0:
+            cap_pct = (state["capital"] - SEED_USDT) / SEED_USDT * 100
             tg(
                 f"⏸ <b>봇 휴식 중</b> ({regime}) | {kst_str}\n"
-                f"━━━━━━━━━━━━━━━\n"
-                f"BTC ${cur_price:,.0f} | SMA(200) ${sma_d:,.0f}\n"
-                f"BEAR regime 진입 시 자동 가동\n"
-                f"잔고: ${state['capital']:.2f}"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"BTC: <b>${cur_price:,.0f}</b>\n"
+                f"Daily SMA(200): ${sma_d:,.0f} ({'+' if sma_dev>=0 else ''}{sma_dev:.2f}%)\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"가동 조건: BTC가 SMA(200)의 -2% 미만으로 떨어지면\n"
+                f"잔고: ${state['capital']:.2f} ({'+' if cap_pct>=0 else ''}{cap_pct:.2f}%)\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"💡 BULL/NEUTRAL 구간 = 현물 BTC 직접 보유가 합리적"
             )
         return
 
@@ -338,33 +390,49 @@ def main():
             new_total = state["total_trades"]
             new_wr = state["wins"] / new_total * 100
             icon = {"TP": "✅", "SL": "❌", "TIME": "⏱"}[outcome]
-            label = {"TP": "익절", "SL": "손절", "TIME": "시간 청산"}[outcome]
-            hold_str = f"{held_runs * 15}분"
+            label = {"TP": "익절 성공", "SL": "손절", "TIME": "시간 청산 (24h)"}[outcome]
+            hold_min = held_runs * 15
+            hold_str = f"{hold_min//60}시간 {hold_min%60}분" if hold_min >= 60 else f"{hold_min}분"
+            move_pct = (entry - exit_p) / entry * 100  # SHORT 수익은 entry > exit
+            roi_pct = net_pnl / pos["capital_at_entry"] * 100 if "capital_at_entry" in pos else 0
 
             tg(
-                f"{icon} <b>[{label}]</b> SHORT | 📋 페이퍼\n"
+                f"{icon} <b>[{label}]</b> SHORT 청산 | 📋 페이퍼\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"진입: ${entry:,.2f} → 청산: ${exit_p:,.2f}\n"
-                f"수익: <b>{'+' if net_pnl>=0 else ''}${net_pnl:.2f}</b>\n"
-                f"보유: {hold_str}\n"
+                f"진입: ${entry:,.2f} ({pos.get('entry_time','')})\n"
+                f"청산: ${exit_p:,.2f} (현재가 ${price:,.2f})\n"
+                f"가격 변동: <b>{'+' if move_pct>=0 else ''}{move_pct:.2f}%</b>\n"
+                f"보유 시간: {hold_str}\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"잔고: <b>${state['capital']:.2f}</b> ({'+' if cap_chg>=0 else ''}{cap_chg:.2f}%)\n"
-                f"오늘: {'+' if state['daily_pnl']>=0 else ''}${state['daily_pnl']:.2f} | "
-                f"누적 {new_total}건 승률 {new_wr:.1f}%"
+                f"수량: {qty:.5f} BTC (${qty*entry:,.0f})\n"
+                f"수수료: ${fee:.3f}\n"
+                f"순손익: <b>{'+' if net_pnl>=0 else ''}${net_pnl:.2f}</b> "
+                f"({'+' if roi_pct>=0 else ''}{roi_pct:.2f}% 자본 대비)\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"잔고: <b>${state['capital']:.2f}</b> "
+                f"({'+' if cap_chg>=0 else ''}{cap_chg:.2f}% 시드 대비)\n"
+                f"오늘 손익: {'+' if state['daily_pnl']>=0 else ''}${state['daily_pnl']:.2f} ({state['daily_trades']}건)\n"
+                f"누적: {new_total}건 | 승률 {new_wr:.1f}% (W{state['wins']}/L{state['losses']})"
             )
 
             # Kill switch
             if state["daily_pnl"] / state["daily_start"] <= -DAILY_LOSS_LIMIT:
                 state["kill_switch"] = True
+                kill_pct = state["daily_pnl"] / state["daily_start"] * 100
                 tg(
-                    f"🚨 <b>Kill Switch 발동</b>\n"
-                    f"일일 손실 한도 {DAILY_LOSS_LIMIT*100:.0f}% 도달\n"
-                    f"잔고: ${state['capital']:.2f} | 자정 후 자동 재개"
+                    f"🚨 <b>Kill Switch 발동!</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"일일 손실: <b>{kill_pct:.1f}%</b> (한도 -{DAILY_LOSS_LIMIT*100:.0f}%)\n"
+                    f"오늘 거래: {state['daily_trades']}건\n"
+                    f"손실액: ${state['daily_pnl']:.2f}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"잔고: ${state['capital']:.2f}\n"
+                    f"오늘 거래 모두 중단 → 자정 KST 이후 자동 재개"
                 )
 
     # 신규 시그널
     if not state["position"]:
-        signal, reason, entry_price, atr_val = generate_short_signal(k15m, k1h, k4h)
+        signal, reason, entry_price, atr_val, diag = generate_short_signal(k15m, k1h, k4h)
         candle_str = str(k15m[-1][0])
 
         if signal == "SHORT" and candle_str != state.get("last_signal_candle"):
@@ -376,65 +444,116 @@ def main():
             qty = risk_amt / sl_dist if sl_dist > 0 else 0
             notional = qty * entry_price
             max_notional = state["capital"] * MAX_POS_PCT * LEVERAGE
+            capped = False
             if notional > max_notional:
                 scale = max_notional / notional
                 qty *= scale
                 notional = qty * entry_price
                 risk_amt = qty * sl_dist
+                capped = True
 
             state["position"] = {
                 "signal": "SHORT", "entry": entry_price,
                 "sl": sl, "tp": tp, "qty": qty,
                 "entry_time": kst_str, "entry_run": run_count,
                 "atr": atr_val,
+                "capital_at_entry": state["capital"],
             }
             state["last_signal_candle"] = candle_str
 
+            est_max_loss = qty * sl_dist
+            est_max_gain = qty * tp_dist - (qty * entry_price + qty * tp) * 0.0004
+            est_max_gain_pct = est_max_gain / state["capital"] * 100
+            est_max_loss_pct = est_max_loss / state["capital"] * 100
+
             tg(
-                f"🔴 <b>[SHORT 진입]</b> 📋 페이퍼 | {kst_str}\n"
+                f"🔴 <b>[SHORT 진입]</b> | {kst_str}\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"BTC: <b>${entry_price:,.2f}</b>\n"
-                f"손절: ${sl:,.2f} (+{sl_dist/entry_price*100:.2f}%)\n"
-                f"익절: ${tp:,.2f} (-{tp_dist/entry_price*100:.2f}%)\n"
-                f"시그널: {reason}\n"
+                f"<b>가격</b>\n"
+                f"  진입가: <b>${entry_price:,.2f}</b>\n"
+                f"  손절가: ${sl:,.2f}  (+{sl_dist/entry_price*100:.2f}%)\n"
+                f"  익절가: ${tp:,.2f}  (-{tp_dist/entry_price*100:.2f}%)\n"
+                f"  R:R = 1 : {ATR_TP_MULT/ATR_SL_MULT:.1f}\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"포지션: ${notional:.2f} ({qty:.5f} BTC)\n"
-                f"위험: ${risk_amt:.2f} ({risk_amt/state['capital']*100:.2f}% 자본)\n"
+                f"<b>시그널 근거</b>\n"
+                f"  추세 1h: {diag.get('trend_1h')} (격차 {diag.get('gap_1h_pct',0):.2f}%)\n"
+                f"  추세 4h: {diag.get('trend_4h')}\n"
+                f"  ATR(15m): {diag.get('atr_now',0):.0f} (avg×{diag.get('atr_ratio',0):.2f})\n"
+                f"  RSI(14): {diag.get('rsi_prev',0):.1f} → {diag.get('rsi_cur',0):.1f}\n"
+                f"  Daily SMA(200): ${sma_d:,.0f} (BTC -{(sma_d-cur_price)/sma_d*100:.2f}%)\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"<b>포지션 사이징</b>\n"
+                f"  수량: {qty:.5f} BTC (≈ ${notional:.2f}{' [cap]' if capped else ''})\n"
+                f"  레버리지: {LEVERAGE}x\n"
+                f"  최대 손실: -${est_max_loss:.2f} ({est_max_loss_pct:.2f}% 자본)\n"
+                f"  최대 수익: +${est_max_gain:.2f} ({est_max_gain_pct:.2f}% 자본)\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"잔고: ${state['capital']:.2f} | 누적 {total}건 승률 {wr_pct:.1f}%"
             )
 
-        # 정기 현황 (BEAR 모드, 신호 없을 때)
+        # 정기 현황 (BEAR 모드, 시그널 없을 때 — 2시간마다)
         elif run_count % STATUS_INTERVAL == 0:
-            pos_status = "없음"
+            cap_pct = (state["capital"] - SEED_USDT) / SEED_USDT * 100
+            sma_dev = ((cur_price - sma_d) / sma_d * 100) if sma_d else 0
+
             if state.get("position"):
                 p = state["position"]
                 unr = p["qty"] * (p["entry"] - price)
-                pos_status = f"SHORT @ ${p['entry']:,.0f} (미실현 {'+' if unr>=0 else ''}${unr:.2f})"
-            cap_pct = (state["capital"] - SEED_USDT) / SEED_USDT * 100
+                unr_pct = unr / p.get("capital_at_entry", state["capital"]) * 100
+                price_move = (p["entry"] - price) / p["entry"] * 100
+                held = run_count - p.get("entry_run", run_count)
+                held_min = held * 15
+                held_str = f"{held_min//60}h {held_min%60}m" if held_min >= 60 else f"{held_min}m"
+                sl_dist_pct = (p["sl"] - price) / price * 100
+                tp_dist_pct = (price - p["tp"]) / price * 100
+                pos_block = (
+                    f"<b>현재 포지션 (SHORT)</b>\n"
+                    f"  진입: ${p['entry']:,.2f} ({p.get('entry_time','')}, {held_str} 보유)\n"
+                    f"  현재: ${price:,.2f} ({'+' if price_move>=0 else ''}{price_move:.2f}%)\n"
+                    f"  미실현 P&L: <b>{'+' if unr>=0 else ''}${unr:.2f}</b> ({'+' if unr_pct>=0 else ''}{unr_pct:.2f}%)\n"
+                    f"  SL까지: {sl_dist_pct:+.2f}% | TP까지: {tp_dist_pct:+.2f}%\n"
+                )
+            else:
+                rsi_str = f"{diag.get('rsi_cur',0):.1f}" if diag.get('rsi_cur') is not None else "?"
+                pos_block = (
+                    f"<b>대기 중</b>\n"
+                    f"  사유: {reason}\n"
+                    f"  RSI(15m): {rsi_str} | ATR ratio: ×{diag.get('atr_ratio',0):.2f}\n"
+                    f"  추세 1h/4h: {diag.get('trend_1h','?')}/{diag.get('trend_4h','?')}\n"
+                )
+
             tg(
                 f"📊 <b>정기 현황</b> (BEAR 가동) | {kst_str}\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"BTC: <b>${price:,.2f}</b> | SMA(200) ${sma_d:,.0f}\n"
-                f"시그널: {signal} ({reason})\n"
-                f"포지션: {pos_status}\n"
+                f"BTC: <b>${price:,.2f}</b>\n"
+                f"Daily SMA(200): ${sma_d:,.0f} (이격 {'+' if sma_dev>=0 else ''}{sma_dev:.2f}%)\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"잔고: ${state['capital']:.2f} ({'+' if cap_pct>=0 else ''}{cap_pct:.2f}%)\n"
+                f"{pos_block}"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"잔고: <b>${state['capital']:.2f}</b> ({'+' if cap_pct>=0 else ''}{cap_pct:.2f}%)\n"
                 f"오늘: {'+' if state['daily_pnl']>=0 else ''}${state['daily_pnl']:.2f} ({state['daily_trades']}건) | "
-                f"누적 {total}건 승률 {wr_pct:.1f}%"
+                f"누적 {total}건 승률 {wr_pct:.1f}% (W{state['wins']}/L{state['losses']})"
             )
 
         # 일일 결산 (자정 KST = UTC 15:00)
         if now.hour == 15 and now.minute < 16:
             cap_pct = (state["capital"] - SEED_USDT) / SEED_USDT * 100
+            day_pnl_pct = state["daily_pnl"] / state["daily_start"] * 100 if state["daily_start"] else 0
             tg(
-                f"🌙 <b>일일 결산</b> ({today_str})\n"
+                f"🌙 <b>일일 결산</b> {today_str}\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"오늘 손익: <b>{'+' if state['daily_pnl']>=0 else ''}${state['daily_pnl']:.2f}</b> "
-                f"({state['daily_trades']}건)\n"
-                f"잔고: <b>${state['capital']:.2f}</b> "
-                f"({'+' if cap_pct>=0 else ''}{cap_pct:.2f}% from ${SEED_USDT:.0f})\n"
+                f"<b>오늘</b>\n"
+                f"  손익: {'+' if state['daily_pnl']>=0 else ''}${state['daily_pnl']:.2f} "
+                f"({'+' if day_pnl_pct>=0 else ''}{day_pnl_pct:.2f}%)\n"
+                f"  거래: {state['daily_trades']}건\n"
+                f"  Regime: {regime}\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"누적 {total}건 | 승률 {wr_pct:.1f}% | W{state['wins']}/L{state['losses']}"
+                f"<b>누적</b>\n"
+                f"  잔고: <b>${state['capital']:.2f}</b> ({'+' if cap_pct>=0 else ''}{cap_pct:.2f}% 시드 대비)\n"
+                f"  거래: {total}건 (W{state['wins']}/L{state['losses']})\n"
+                f"  승률: {wr_pct:.1f}%\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"내일도 BEAR 지속 시 봇 가동"
             )
 
     save_state(state)
